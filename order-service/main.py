@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pika
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, String, DateTime
 from sqlalchemy.orm import (
@@ -23,7 +23,10 @@ DATABASE_URL = os.getenv(
 )
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger("order-service")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -59,11 +62,14 @@ def startup():
     Base.metadata.create_all(bind=engine)
 
 
-def publish_order_event(order_id, product, quantity, created_at):
+def publish_order_event(
+    order_id, product, quantity, created_at, correlation_id
+):
     event = {
         "event_id": str(uuid.uuid4()),
         "event_type": "OrderPlaced",
         "order_id": order_id,
+        "correlation_id": correlation_id,
         "product": product,
         "quantity": quantity,
         "created_at": created_at.isoformat(),
@@ -96,14 +102,17 @@ def publish_order_event(order_id, product, quantity, created_at):
                     delivery_mode=2,
                     content_type="application/json",
                     message_id=event["event_id"],
+                    correlation_id=correlation_id,
                 ),
                 mandatory=True,
             )
 
             logger.info(
-                "OrderPlaced event published order_id=%s event_id=%s",
+                "OrderPlaced event published order_id=%s "
+                "event_id=%s correlation_id=%s",
                 order_id,
                 event["event_id"],
+                correlation_id,
             )
             return
 
@@ -126,9 +135,18 @@ def health():
 
 
 @app.post("/orders", status_code=201)
-def place_order(request: OrderRequest):
+def place_order(request: OrderRequest, http_request: Request):
+    # Reuse a valid incoming correlation ID or create a new one.
+    incoming_id = http_request.headers.get("X-Correlation-ID")
+    correlation_id = incoming_id or str(uuid.uuid4())
+
     order_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc)
+
+    logger.info(
+        "Order request received correlation_id=%s",
+        correlation_id,
+    )
 
     order = Order(
         id=order_id,
@@ -143,6 +161,10 @@ def place_order(request: OrderRequest):
             session.add(order)
             session.commit()
     except Exception as exc:
+        logger.exception(
+            "Order database save failed correlation_id=%s",
+            correlation_id,
+        )
         raise HTTPException(
             status_code=503,
             detail="Order could not be saved",
@@ -154,19 +176,27 @@ def place_order(request: OrderRequest):
             request.product,
             request.quantity,
             created_at,
+            correlation_id,
         )
     except Exception as exc:
-        logger.exception("Order saved but event publishing failed")
+        logger.exception(
+            "Order saved but event publishing failed "
+            "correlation_id=%s order_id=%s",
+            correlation_id,
+            order_id,
+        )
         raise HTTPException(
             status_code=503,
             detail={
                 "message": "Order was saved but event publishing failed",
                 "order_id": order_id,
+                "correlation_id": correlation_id,
             },
         ) from exc
 
     return {
         "order_id": order_id,
+        "correlation_id": correlation_id,
         "product": request.product,
         "quantity": request.quantity,
         "status": "PLACED",

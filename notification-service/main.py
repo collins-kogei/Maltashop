@@ -3,14 +3,13 @@ import json
 import os
 import time
 import logging
-import uuid
 
 import pika
 import psycopg
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("notification-service")
 
@@ -19,6 +18,7 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://notifications:notify_pass@notification-db:5432/notifications",
 )
+
 
 def save_notification(event):
     with psycopg.connect(DATABASE_URL) as conn:
@@ -47,8 +47,10 @@ def save_notification(event):
             )
         conn.commit()
 
+
 def main():
     while True:
+        connection = None
         try:
             connection = pika.BlockingConnection(
                 pika.ConnectionParameters(
@@ -58,19 +60,33 @@ def main():
                 )
             )
             channel = connection.channel()
-            channel.queue_declare(queue="order_events", durable=True)
+            channel.queue_declare(
+                queue="order_events",
+                durable=True,
+            )
             channel.basic_qos(prefetch_count=1)
 
             def handle_event(ch, method, properties, body):
                 try:
                     event = json.loads(body)
                     save_notification(event)
+
+                    correlation_id = event.get(
+                        "correlation_id", "missing"
+                    )
+
                     logger.info(
-                        "Notification processed order_id=%s event_id=%s",
+                        "Notification processed order_id=%s "
+                        "event_id=%s correlation_id=%s",
                         event["order_id"],
                         event["event_id"],
+                        correlation_id,
                     )
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+                    ch.basic_ack(
+                        delivery_tag=method.delivery_tag
+                    )
+
                 except Exception:
                     logger.exception("Event processing failed")
                     ch.basic_nack(
@@ -82,12 +98,20 @@ def main():
                 queue="order_events",
                 on_message_callback=handle_event,
             )
+
             logger.info("Waiting for order events")
             channel.start_consuming()
 
         except Exception:
-            logger.exception("Consumer connection failed; retrying")
+            logger.exception(
+                "Consumer connection failed; retrying"
+            )
             time.sleep(5)
+
+        finally:
+            if connection is not None and connection.is_open:
+                connection.close()
+
 
 if __name__ == "__main__":
     main()
